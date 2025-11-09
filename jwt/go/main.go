@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -23,11 +25,17 @@ import (
 
 // Token represents a JWT token
 type Token struct {
-	Id        string    `json:"id"`
+	Id        string    `json:"id"` // jti (UUID)
 	IsRevoked bool      `json:"is_revoked"`
 	IssuedAt  time.Time `json:"issued_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// Optional audit fields:
+	Token      string     `json:"token,omitempty"` // jwt full token string
+	ClientIP   string     `json:"client_ip,omitempty"`
+	UserAgent  string     `json:"user_agent,omitempty"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 }
 
 // --- DATABASE ---
@@ -80,10 +88,10 @@ func (s *SqliteDB) RunMigrations(ctx context.Context) error {
 
 	m1 := `CREATE TABLE IF NOT EXISTS tokens (
 		id          TEXT PRIMARY KEY,
-		is_revoked  INTEGER NOT NULL DEFAULT 0,
-		issued_at   TEXT NOT NULL DEFAULT (datetime('now')),
+		is_revoked  INTEGER NOT NULL,
+		issued_at   TEXT NOT NULL,
 		expires_at  TEXT NOT NULL,
-		updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+		updated_at  TEXT NOT NULL
 	)`
 
 	// Run migrations
@@ -133,21 +141,24 @@ func (s *SqliteDB) ListTokens(ctx context.Context) ([]Token, error) {
 		// Convert INTEGER to boolean
 		token.IsRevoked = isRevokedInt != 0
 
-		// Parse datetime strings to time.Time
-		token.IssuedAt, err = time.Parse("2006-01-02 15:04:05", issuedAtStr)
+		// Parse Unix timestamps to time.Time
+		issuedAtUnix, err := strconv.ParseInt(issuedAtStr, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse issued_at: %w", err)
 		}
+		token.IssuedAt = time.Unix(issuedAtUnix, 0)
 
-		token.ExpiresAt, err = time.Parse("2006-01-02 15:04:05", expiresAtStr)
+		expiresAtUnix, err := strconv.ParseInt(expiresAtStr, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse expires_at: %w", err)
 		}
+		token.ExpiresAt = time.Unix(expiresAtUnix, 0)
 
-		token.UpdatedAt, err = time.Parse("2006-01-02 15:04:05", updatedAtStr)
+		updatedAtUnix, err := strconv.ParseInt(updatedAtStr, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse updated_at: %w", err)
 		}
+		token.UpdatedAt = time.Unix(updatedAtUnix, 0)
 
 		tokens = append(tokens, token)
 	}
@@ -159,11 +170,40 @@ func (s *SqliteDB) ListTokens(ctx context.Context) ([]Token, error) {
 	return tokens, nil
 }
 
+// CreateToken creates a new token record in the database
+func (s *SqliteDB) CreateToken(ctx context.Context, token Token) error {
+	query := `
+	INSERT INTO tokens (
+	    id, is_revoked, issued_at, expires_at, updated_at
+	) VALUES (?, ?, ?, ?, ?);
+	`
+
+	isRevokedInt := 0
+	if token.IsRevoked {
+		isRevokedInt = 1
+	}
+
+	_, err := s.db.ExecContext(
+		ctx,
+		query,
+		token.Id,
+		isRevokedInt,
+		token.IssuedAt.Unix(),
+		token.ExpiresAt.Unix(),
+		token.UpdatedAt.Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("CreateToken: failed to insert: %w", err)
+	}
+	return nil
+}
+
 // --- SERVER ---
 
 // Server holds server state and dependencies
 type Server struct {
-	SDB SqliteDB
+	SDB       SqliteDB
+	JWTSecret []byte
 }
 
 // Handle panic errors to prevent server shutdown
@@ -223,6 +263,89 @@ func (s *Server) Tokens(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// SignUp creates a new JWT token and stores it in the database
+func (s *Server) SignUp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Failed to parse the form", http.StatusBadGateway)
+		return
+	}
+
+	expSecStr := r.FormValue("expires_sec")
+	expDuration := 24 * time.Hour // default 24 hours
+	if expSecStr != "" {
+		if expSec, err := strconv.ParseInt(expSecStr, 10, 64); err == nil {
+			expDuration = time.Duration(expSec) * time.Second
+		} else {
+			http.Error(w, "Invalid expires_sec parameter", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Setup token
+	now := time.Now()
+	expiresAt := now.Add(expDuration)
+	tokenId := uuid.New()
+
+	// Create JWT claims
+	claims := jwt.MapClaims{
+		"jti": tokenId,          // JWT ID
+		"iat": now.Unix(),       // Issued at
+		"exp": expiresAt.Unix(), // Expiration time
+		"nbf": now.Unix(),       // Not before
+	}
+
+	// Create token
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	// Sign token with secret
+	tokenString, err := token.SignedString(s.JWTSecret)
+	if err != nil {
+		log.Printf("SignUp, error signing token: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Collect client info for replay analysis
+	clientIP := r.Header.Get("X-Forwarded-For")
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+
+	t := Token{
+		Id:        tokenId.String(),
+		IsRevoked: false,
+		IssuedAt:  now,
+		ExpiresAt: expiresAt,
+		UpdatedAt: now,
+
+		Token:     tokenString,
+		ClientIP:  clientIP,
+		UserAgent: r.UserAgent(),
+	}
+
+	// Store token in database
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := s.SDB.CreateToken(ctx, t); err != nil {
+		log.Printf("SignUp, error storing token: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(t); err != nil {
+		log.Printf("SignUp, error encoding response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
 // --- MAIN ENTRYPOINT ---
 
 const (
@@ -230,6 +353,8 @@ const (
 
 	DefaultServerAddr = "localhost"
 	DefaultServerPort = "8080"
+
+	DefaultJWTSecret = "00000000-0000-0000-1000-000000000000"
 )
 
 func main() {
@@ -278,14 +403,25 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Get JWT secret from environment or use default
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		fmt.Println("Set default JWT secret")
+		jwtSecret = DefaultJWTSecret
+	}
+
 	// Create HTTP server
-	server := Server{SDB: *database}
+	server := Server{
+		SDB:       *database,
+		JWTSecret: []byte(jwtSecret),
+	}
 
 	mux := http.NewServeMux()
 
 	// Register routes
 	mux.HandleFunc("/ping", server.Ping)
 	mux.HandleFunc("/tokens", server.Tokens)
+	mux.HandleFunc("/signup", server.SignUp)
 
 	commonHandler := server.logMiddleware(mux)
 	commonHandler = server.panicMiddleware(commonHandler)
