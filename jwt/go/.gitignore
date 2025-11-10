@@ -53,3 +53,5 @@ jwtgo
 !jwtgo/
 
 jwtgo.sqlite
+jwtgo.sqlite-shm
+jwtgo.sqlite-wal
