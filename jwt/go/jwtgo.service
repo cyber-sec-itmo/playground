@@ -1,5 +1,5 @@
 [Unit]
-Description=JWT Go API server
+Description=JWT Go API Server
 After=network.target
 StartLimitIntervalSec=300
 StartLimitBurst=3
