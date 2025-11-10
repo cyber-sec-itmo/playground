@@ -90,19 +90,19 @@ curl -X POST http://localhost:8080/tokens/auth \
 #### Валидация токена
 
 ```bash
-curl "http://localhost:8080/tokens/validate?token=<JWT_TOKEN>"
+curl "http://localhost:8080/tokens/validate?token=$JWT_TOKEN"
 ```
 
 #### Получение истории использования
 
 ```bash
-curl "http://localhost:8080/tokens/usage?token=<JWT_TOKEN>"
+curl "http://localhost:8080/tokens/usage?token=$JWT_TOKEN"
 ```
 
 #### Отзыв токена
 
 ```bash
-curl -X DELETE "http://localhost:8080/tokens/revoke?token=<JWT_TOKEN>"
+curl -X DELETE "http://localhost:8080/tokens/revoke?token=$JWT_TOKEN"
 ```
 
 #### Получение списка всех токенов
