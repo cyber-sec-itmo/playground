@@ -21,21 +21,40 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+const (
+	DefaultDatabaseSqliteURI = "jwtgo.sqlite"
+
+	DefaultServerAddr = "localhost"
+	DefaultServerPort = "8080"
+
+	DefaultJWTSecret = "00000000-0000-0000-1000-000000000000"
+)
+
 // --- DATA STRUCTURE ---
 
 // Token represents a JWT token
 type Token struct {
-	Id        string    `json:"id"` // jti (UUID)
+	ID        string    `json:"id"` // jti (UUID)
 	IsRevoked bool      `json:"is_revoked"`
 	IssuedAt  time.Time `json:"issued_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	ClientIP  string    `json:"client_ip"`
+	UserAgent string    `json:"user_agent"`
 
 	// Optional audit fields:
-	Token      string     `json:"token,omitempty"` // jwt full token string
-	ClientIP   string     `json:"client_ip,omitempty"`
-	UserAgent  string     `json:"user_agent,omitempty"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	Token string `json:"token,omitempty"` // jwt full token string
+}
+
+// TokenUsage represents a single usage event for a token
+type TokenUsage struct {
+	ID        int64     `json:"id"`
+	TokenID   string    `json:"token_id"`
+	TS        time.Time `json:"ts"`
+	ClientIP  string    `json:"client_ip"`
+	UserAgent string    `json:"user_agent"`
+	Method    string    `json:"method"`
+	Status    int       `json:"status"`
 }
 
 // --- DATABASE ---
@@ -91,12 +110,30 @@ func (s *SqliteDB) RunMigrations(ctx context.Context) error {
 		is_revoked  INTEGER NOT NULL,
 		issued_at   TEXT NOT NULL,
 		expires_at  TEXT NOT NULL,
-		updated_at  TEXT NOT NULL
-	)`
+		updated_at  TEXT NOT NULL,
+		client_ip   TEXT,
+		user_agent 	TEXT
+	);`
 
-	// Run migrations
+	m2 := `CREATE TABLE IF NOT EXISTS token_usages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		token_id TEXT NOT NULL,
+		ts INTEGER NOT NULL,
+		client_ip   TEXT,
+		user_agent 	TEXT,
+		method TEXT,
+		status INTEGER,
+		FOREIGN KEY (token_id) REFERENCES tokens(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_usage_token_ts ON token_usages(token_id, ts);`
+
+	// Run migrations sequentially
 	if _, err := s.db.ExecContext(ctx, m1); err != nil {
 		return fmt.Errorf("failed to run migration m1: %w", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, m2); err != nil {
+		return fmt.Errorf("failed to run migration m2: %w", err)
 	}
 
 	return nil
@@ -118,8 +155,39 @@ func (s *SqliteDB) Close() error {
 	return nil
 }
 
+// parseTokenFromDb fills a Token struct from database row values
+func parseTokenFromDb(token *Token, isRevokedInt int, issuedAtStr, expiresAtStr, updatedAtStr string, clientIP, userAgent sql.NullString) error {
+	// Convert INTEGER to boolean
+	token.IsRevoked = isRevokedInt != 0
+
+	// Parse Unix timestamps to time.Time
+	issuedAtUnix, err := strconv.ParseInt(issuedAtStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse issued_at: %w", err)
+	}
+	token.IssuedAt = time.Unix(issuedAtUnix, 0)
+
+	expiresAtUnix, err := strconv.ParseInt(expiresAtStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse expires_at: %w", err)
+	}
+	token.ExpiresAt = time.Unix(expiresAtUnix, 0)
+
+	updatedAtUnix, err := strconv.ParseInt(updatedAtStr, 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse updated_at: %w", err)
+	}
+	token.UpdatedAt = time.Unix(updatedAtUnix, 0)
+
+	// Set client_ip and user_agent
+	token.ClientIP = clientIP.String
+	token.UserAgent = userAgent.String
+
+	return nil
+}
+
 func (s *SqliteDB) ListTokens(ctx context.Context) ([]Token, error) {
-	query := "SELECT id, is_revoked, issued_at, expires_at, updated_at FROM tokens ORDER BY updated_at"
+	query := "SELECT id, is_revoked, issued_at, expires_at, updated_at, client_ip, user_agent FROM tokens ORDER BY updated_at"
 
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
@@ -132,33 +200,16 @@ func (s *SqliteDB) ListTokens(ctx context.Context) ([]Token, error) {
 		var token Token
 		var issuedAtStr, expiresAtStr, updatedAtStr string
 		var isRevokedInt int
+		var clientIP, userAgent sql.NullString
 
-		err := rows.Scan(&token.Id, &isRevokedInt, &issuedAtStr, &expiresAtStr, &updatedAtStr)
+		err := rows.Scan(&token.ID, &isRevokedInt, &issuedAtStr, &expiresAtStr, &updatedAtStr, &clientIP, &userAgent)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan token row: %w", err)
 		}
 
-		// Convert INTEGER to boolean
-		token.IsRevoked = isRevokedInt != 0
-
-		// Parse Unix timestamps to time.Time
-		issuedAtUnix, err := strconv.ParseInt(issuedAtStr, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse issued_at: %w", err)
+		if err := parseTokenFromDb(&token, isRevokedInt, issuedAtStr, expiresAtStr, updatedAtStr, clientIP, userAgent); err != nil {
+			return nil, err
 		}
-		token.IssuedAt = time.Unix(issuedAtUnix, 0)
-
-		expiresAtUnix, err := strconv.ParseInt(expiresAtStr, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse expires_at: %w", err)
-		}
-		token.ExpiresAt = time.Unix(expiresAtUnix, 0)
-
-		updatedAtUnix, err := strconv.ParseInt(updatedAtStr, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse updated_at: %w", err)
-		}
-		token.UpdatedAt = time.Unix(updatedAtUnix, 0)
 
 		tokens = append(tokens, token)
 	}
@@ -174,8 +225,8 @@ func (s *SqliteDB) ListTokens(ctx context.Context) ([]Token, error) {
 func (s *SqliteDB) CreateToken(ctx context.Context, token Token) error {
 	query := `
 	INSERT INTO tokens (
-	    id, is_revoked, issued_at, expires_at, updated_at
-	) VALUES (?, ?, ?, ?, ?);
+	    id, is_revoked, issued_at, expires_at, updated_at, client_ip, user_agent
+	) VALUES (?, ?, ?, ?, ?, ?, ?);
 	`
 
 	isRevokedInt := 0
@@ -186,16 +237,156 @@ func (s *SqliteDB) CreateToken(ctx context.Context, token Token) error {
 	_, err := s.db.ExecContext(
 		ctx,
 		query,
-		token.Id,
+		token.ID,
 		isRevokedInt,
 		token.IssuedAt.Unix(),
 		token.ExpiresAt.Unix(),
 		token.UpdatedAt.Unix(),
+		token.ClientIP,
+		token.UserAgent,
 	)
 	if err != nil {
 		return fmt.Errorf("CreateToken: failed to insert: %w", err)
 	}
 	return nil
+}
+
+// GetTokenByID retrieves a token by its ID from the database
+func (s *SqliteDB) GetTokenByID(ctx context.Context, tokenID string) (*Token, error) {
+	query := "SELECT id, is_revoked, issued_at, expires_at, updated_at, client_ip, user_agent FROM tokens WHERE id = ?"
+
+	var token Token
+	var issuedAtStr, expiresAtStr, updatedAtStr string
+	var isRevokedInt int
+	var clientIP, userAgent sql.NullString
+
+	err := s.db.QueryRowContext(ctx, query, tokenID).Scan(
+		&token.ID,
+		&isRevokedInt,
+		&issuedAtStr,
+		&expiresAtStr,
+		&updatedAtStr,
+		&clientIP,
+		&userAgent,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil // Token not found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to query token: %w", err)
+	}
+
+	if err := parseTokenFromDb(&token, isRevokedInt, issuedAtStr, expiresAtStr, updatedAtStr, clientIP, userAgent); err != nil {
+		return nil, err
+	}
+
+	return &token, nil
+}
+
+// CreateTokenUsage creates a new token usage record in the database
+func (s *SqliteDB) CreateTokenUsage(ctx context.Context, tokenID string, ts int64, clientIP, userAgent, method string, status int) error {
+	query := `
+	INSERT INTO token_usages (
+	    token_id, ts, client_ip, user_agent, method, status
+	) VALUES (?, ?, ?, ?, ?, ?);
+	`
+
+	_, err := s.db.ExecContext(
+		ctx,
+		query,
+		tokenID,
+		ts,
+		clientIP,
+		userAgent,
+		method,
+		status,
+	)
+	if err != nil {
+		return fmt.Errorf("CreateTokenUsage: failed to insert: %w", err)
+	}
+	return nil
+}
+
+// RevokeToken marks a token as revoked in the database and returns the updated token
+func (s *SqliteDB) RevokeToken(ctx context.Context, tokenID string) (*Token, error) {
+	query := `
+	UPDATE tokens 
+	SET is_revoked = 1, updated_at = ?
+	WHERE id = ?
+	RETURNING id, is_revoked, issued_at, expires_at, updated_at, client_ip, user_agent;
+	`
+
+	now := time.Now()
+	var token Token
+	var issuedAtStr, expiresAtStr, updatedAtStr string
+	var isRevokedInt int
+	var clientIP, userAgent sql.NullString
+
+	err := s.db.QueryRowContext(
+		ctx,
+		query,
+		now.Unix(),
+		tokenID,
+	).Scan(
+		&token.ID,
+		&isRevokedInt,
+		&issuedAtStr,
+		&expiresAtStr,
+		&updatedAtStr,
+		&clientIP,
+		&userAgent,
+	)
+	if err == sql.ErrNoRows {
+		return nil, sql.ErrNoRows // Token not found
+	}
+	if err != nil {
+		return nil, fmt.Errorf("RevokeToken: failed to update: %w", err)
+	}
+
+	if err := parseTokenFromDb(&token, isRevokedInt, issuedAtStr, expiresAtStr, updatedAtStr, clientIP, userAgent); err != nil {
+		return nil, err
+	}
+
+	return &token, nil
+}
+
+// ListTokenUsage returns usage events for a given token ID ordered by timestamp descending
+func (s *SqliteDB) ListTokenUsage(ctx context.Context, tokenID string) ([]TokenUsage, error) {
+	query := `
+	SELECT id, token_id, ts, client_ip, user_agent, method, status
+	FROM token_usages
+	WHERE token_id = ?
+	ORDER BY ts DESC`
+
+	rows, err := s.db.QueryContext(ctx, query, tokenID)
+	if err != nil {
+		return nil, fmt.Errorf("ListTokenUsage: failed to query: %w", err)
+	}
+	defer rows.Close()
+
+	usages := []TokenUsage{}
+	for rows.Next() {
+		var usage TokenUsage
+		var tsInt int64
+		var clientIP, userAgent, method sql.NullString
+
+		if err := rows.Scan(&usage.ID, &usage.TokenID, &tsInt, &clientIP, &userAgent, &method, &usage.Status); err != nil {
+			return nil, fmt.Errorf("ListTokenUsage: failed to scan row: %w", err)
+		}
+
+		usage.TS = time.Unix(tsInt, 0)
+		usage.ClientIP = clientIP.String
+		usage.UserAgent = userAgent.String
+		usage.Method = method.String
+
+		usages = append(usages, usage)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListTokenUsage: row iteration error: %w", err)
+	}
+
+	return usages, nil
 }
 
 // --- SERVER ---
@@ -204,6 +395,29 @@ func (s *SqliteDB) CreateToken(ctx context.Context, token Token) error {
 type Server struct {
 	SDB       SqliteDB
 	JWTSecret []byte
+}
+
+// collectClientInfo extracts client IP and user agent from request
+func collectClientInfo(r *http.Request) (clientIP, userAgent string) {
+	// Extract IP address
+	clientIP = r.Header.Get("X-Forwarded-For")
+	if clientIP == "" {
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			clientIP = r.RemoteAddr
+		} else {
+			clientIP = ip
+		}
+	} else {
+		// X-Forwarded-For can contain multiple IPs, take the first one
+		ips := strings.Split(clientIP, ",")
+		clientIP = strings.TrimSpace(ips[0])
+	}
+
+	// Extract user agent
+	userAgent = r.UserAgent()
+
+	return clientIP, userAgent
 }
 
 // Handle panic errors to prevent server shutdown
@@ -226,13 +440,54 @@ func (s *Server) logMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 
-		ip, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Unable to parse client IP: %s", r.RemoteAddr), http.StatusBadRequest)
-			return
+		// Extract client info
+		ip, userAgent := collectClientInfo(r)
+
+		// Build full URL (path + query)
+		fullURL := r.URL.Path
+		if r.URL.RawQuery != "" {
+			fullURL += "?" + r.URL.RawQuery
 		}
-		log.Printf("%s %s %s\n", ip, r.Method, r.URL.Path)
+
+		// Log with all information
+		log.Printf("%s %s %s user_agent=%s\n", ip, r.Method, fullURL, userAgent)
 	})
+}
+
+// parseJWTToken parses JWT token string and returns token, claims, and jti
+func (s *Server) parseJWTToken(tokenString string) (*jwt.Token, jwt.MapClaims, string, error) {
+	if tokenString == "" {
+		return nil, nil, "", fmt.Errorf("empty token string")
+	}
+
+	// Parse JWT token
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		// Validate signing method
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return s.JWTSecret, nil
+	})
+
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	if !token.Valid {
+		return nil, nil, "", fmt.Errorf("invalid token")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, nil, "", fmt.Errorf("invalid token claims")
+	}
+
+	jti, ok := claims["jti"].(string)
+	if !ok {
+		return nil, nil, "", fmt.Errorf("missing jti in token claims")
+	}
+
+	return token, claims, jti, nil
 }
 
 // Ping handles the ping-pong endpoint
@@ -263,8 +518,8 @@ func (s *Server) Tokens(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// SignUp creates a new JWT token and stores it in the database
-func (s *Server) SignUp(w http.ResponseWriter, r *http.Request) {
+// TokensAuth creates a new JWT token and stores it in the database (imitation of sign-up/login)
+func (s *Server) TokensAuth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -289,11 +544,11 @@ func (s *Server) SignUp(w http.ResponseWriter, r *http.Request) {
 	// Setup token
 	now := time.Now()
 	expiresAt := now.Add(expDuration)
-	tokenId := uuid.New()
+	tokenID := uuid.New()
 
 	// Create JWT claims
 	claims := jwt.MapClaims{
-		"jti": tokenId,          // JWT ID
+		"jti": tokenID,          // JWT ID
 		"iat": now.Unix(),       // Issued at
 		"exp": expiresAt.Unix(), // Expiration time
 		"nbf": now.Unix(),       // Not before
@@ -311,21 +566,18 @@ func (s *Server) SignUp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Collect client info for replay analysis
-	clientIP := r.Header.Get("X-Forwarded-For")
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
-	}
+	clientIP, userAgent := collectClientInfo(r)
 
 	t := Token{
-		Id:        tokenId.String(),
+		ID:        tokenID.String(),
 		IsRevoked: false,
 		IssuedAt:  now,
 		ExpiresAt: expiresAt,
 		UpdatedAt: now,
-
-		Token:     tokenString,
 		ClientIP:  clientIP,
-		UserAgent: r.UserAgent(),
+		UserAgent: userAgent,
+
+		Token: tokenString,
 	}
 
 	// Store token in database
@@ -338,6 +590,11 @@ func (s *Server) SignUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Record token usage (creation)
+	if err := s.SDB.CreateTokenUsage(ctx, t.ID, now.Unix(), clientIP, r.UserAgent(), r.Method, http.StatusCreated); err != nil {
+		log.Printf("TokensAuth, error recording token usage: %v", err)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(t); err != nil {
 		log.Printf("SignUp, error encoding response: %v", err)
@@ -346,16 +603,166 @@ func (s *Server) SignUp(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// TokensValidate checks the token valid status
+func (s *Server) TokensValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get token from query parameter
+	tokenString := r.URL.Query().Get("token")
+	if tokenString == "" {
+		http.Error(w, "Missing token parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Parse and validate JWT token
+	_, _, jti, err := s.parseJWTToken(tokenString)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	// Check if token is revoked in database
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	dbToken, err := s.SDB.GetTokenByID(ctx, jti)
+	if err != nil {
+		log.Printf("TokensValidate, error querying token: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// If token not found in database, consider it invalid
+	if dbToken == nil {
+		http.Error(w, "Token not found", http.StatusUnauthorized)
+		return
+	}
+
+	// Collect client info for usage tracking
+	clientIP, userAgent := collectClientInfo(r)
+
+	// Check if token is revoked
+	if dbToken.IsRevoked {
+		http.Error(w, "Token revoked", http.StatusForbidden)
+		return
+	}
+
+	// Record token usage
+	now := time.Now()
+	if err := s.SDB.CreateTokenUsage(ctx, jti, now.Unix(), clientIP, userAgent, r.Method, http.StatusOK); err != nil {
+		log.Printf("TokensValidate, error recording token usage: %v", err)
+		// Don't fail the request if usage recording fails, just log it
+	}
+
+	// Token is valid and not revoked, return full token
+	dbToken.Token = tokenString
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(dbToken); err != nil {
+		log.Printf("TokensValidate, error encoding response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// TokensUsage returns usage of exact token
+func (s *Server) TokensUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	tokenParam := r.URL.Query().Get("token")
+	if tokenParam == "" {
+		http.Error(w, "Missing token parameter", http.StatusBadRequest)
+		return
+	}
+
+	_, _, tokenID, err := s.parseJWTToken(tokenParam)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	usages, err := s.SDB.ListTokenUsage(ctx, tokenID)
+	if err != nil {
+		log.Printf("TokensUsage, error querying usages: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(usages); err != nil {
+		log.Printf("TokensUsage, error encoding response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// TokensRevoke invalidates the token
+func (s *Server) TokensRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get token from query parameter
+	tokenString := r.URL.Query().Get("token")
+	if tokenString == "" {
+		http.Error(w, "Missing token parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Parse JWT token to extract jti
+	_, _, tokenID, err := s.parseJWTToken(tokenString)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	// Revoke token in database
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	token, err := s.SDB.RevokeToken(ctx, tokenID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "Token not found", http.StatusNotFound)
+			return
+		}
+		log.Printf("TokensRevoke, error revoking token: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Collect client info for usage tracking
+	clientIP, userAgent := collectClientInfo(r)
+
+	// Record token usage
+	now := time.Now()
+	if err := s.SDB.CreateTokenUsage(ctx, tokenID, now.Unix(), clientIP, userAgent, r.Method, http.StatusOK); err != nil {
+		log.Printf("TokensRevoke, error recording token usage: %v", err)
+		// Don't fail the request if usage recording fails, just log it
+	}
+
+	// Return the revoked token
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(token); err != nil {
+		log.Printf("TokensRevoke, error encoding response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
 // --- MAIN ENTRYPOINT ---
-
-const (
-	DefaultDatabaseSqliteURI = "jwtgo.sqlite"
-
-	DefaultServerAddr = "localhost"
-	DefaultServerPort = "8080"
-
-	DefaultJWTSecret = "00000000-0000-0000-1000-000000000000"
-)
 
 func main() {
 	dbUri := os.Getenv("DATABASE_URI")
@@ -421,7 +828,10 @@ func main() {
 	// Register routes
 	mux.HandleFunc("/ping", server.Ping)
 	mux.HandleFunc("/tokens", server.Tokens)
-	mux.HandleFunc("/signup", server.SignUp)
+	mux.HandleFunc("/tokens/auth", server.TokensAuth)
+	mux.HandleFunc("/tokens/validate", server.TokensValidate)
+	mux.HandleFunc("/tokens/usage", server.TokensUsage)
+	mux.HandleFunc("/tokens/revoke", server.TokensRevoke)
 
 	commonHandler := server.logMiddleware(mux)
 	commonHandler = server.panicMiddleware(commonHandler)
