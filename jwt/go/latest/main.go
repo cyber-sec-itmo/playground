@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	_ "net/http/pprof"
+
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
@@ -610,8 +612,8 @@ func (s *Server) TokensValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get token from query parameter
-	tokenString := r.URL.Query().Get("token")
+	auth := r.Header.Get("Authorization")
+	tokenString := strings.TrimPrefix(auth, "Bearer ")
 	if tokenString == "" {
 		http.Error(w, "Missing token parameter", http.StatusBadRequest)
 		return
@@ -840,6 +842,10 @@ func main() {
 		Addr:    fmt.Sprintf("%s:%s", serverAddr, serverPort),
 		Handler: commonHandler,
 	}
+
+	go func() {
+		http.ListenAndServe("localhost:6060", nil)
+	}()
 
 	// Start server in a goroutine
 	go func() {

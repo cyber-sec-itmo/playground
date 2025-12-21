@@ -1,4 +1,4 @@
-module github.com/cyber-sec-itmo/playground/jwt/go
+module github.com/cyber-sec-itmo/playground/jwt/go/shared
 
 go 1.25.1
 
